@@ -94,9 +94,9 @@ def run_benchmark():
     # [核心修正] 将结果收集移到循环外部，以便所有HEAD_DIM的结果都在一张表里
     all_results = {}
 
-    for HEAD_DIM in [64, 128, 256, 512]:
+    for HEAD_DIM in [64, 128, 256]:
         # --- a. 定义测试参数 ---
-        Z, H, N_CTX_Q, N_CTX_KV = 64, 16, 16, 3000
+        Z, H, N_CTX_Q, N_CTX_KV = 128, 16, 16, 3000
         dtype = torch.float16
         device = "cuda"
 
