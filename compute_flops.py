@@ -90,103 +90,103 @@ def run_benchmark():
     print("\n" + "="*80)
     print("开始性能对比测试 (使用差值法测量反向传播，避免OOM)")
     print("="*80)
-    
-    # --- a. 定义测试参数 ---
-    Z, H, N_CTX_Q, N_CTX_KV, HEAD_DIM = 256, 32, 16, 768, 128
-    dtype = torch.float16
-    device = "cuda"
+    for HEAD_DIM in [64, 128,256,512]:
+        # --- a. 定义测试参数 ---
+        Z, H, N_CTX_Q, N_CTX_KV = 512, 32, 16, 3000
+        dtype = torch.float16
+        device = "cuda"
 
-    print("测试参数:")
-    print(f"  - Q Shape: [{Z}, {H}, {N_CTX_Q}, {HEAD_DIM}]")
-    print(f"  - K/V Shape: [{Z}, {H}, {N_CTX_KV}, {HEAD_DIM}]")
-    print("-"*80)
+        print("测试参数:")
+        print(f"  - Q Shape: [{Z}, {H}, {N_CTX_Q}, {HEAD_DIM}]")
+        print(f"  - K/V Shape: [{Z}, {H}, {N_CTX_KV}, {HEAD_DIM}]")
+        print("-"*80)
 
-    # --- b. 计算理论FLOPs ---
-    flops_fwd = 4 * Z * H * N_CTX_Q * N_CTX_KV * HEAD_DIM
-    flops_bwd = flops_fwd * 2.5
-    print(f"理论浮点运算量 (FLOPs): 前向 ~{flops_fwd / 1e9:.2f} GFLOPs, 反向 ~{flops_bwd / 1e9:.2f} GFLOPs")
-    print("-"*80)
+        # --- b. 计算理论FLOPs ---
+        flops_fwd = 4 * Z * H * N_CTX_Q * N_CTX_KV * HEAD_DIM
+        flops_bwd = flops_fwd * 2.5
+        print(f"理论浮点运算量 (FLOPs): 前向 ~{flops_fwd / 1e9:.2f} GFLOPs, 反向 ~{flops_bwd / 1e9:.2f} GFLOPs")
+        print("-"*80)
 
-    results = {}
-    providers = ['quantized', 'fp16'] if HAS_FLASH_ATTN else ['quantized']
-    names = {'quantized': '我的量化版Triton (INT8)', 'fp16': '官方FlashAttention (FP16)'}
+        results = {}
+        providers = ['quantized', 'fp16'] if HAS_FLASH_ATTN else ['quantized']
+        names = {'quantized': '我的量化版Triton (INT8)', 'fp16': '官方FlashAttention (FP16)'}
 
-    for provider in providers:
-        print(f"\n[{providers.index(provider)+1}] 正在测试 {names[provider]}...")
+        for provider in providers:
+            print(f"\n[{providers.index(provider)+1}] 正在测试 {names[provider]}...")
+            
+            q = torch.randn((Z, H, N_CTX_Q, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+            kv_fp16 = torch.randn((Z, H, N_CTX_KV, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+            sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+            
+            # 定义前向函数
+            if provider == 'quantized':
+                kv_quant_data = asymmetric_quant_per_token(kv_fp16)
+                fwd_fn = lambda: quant_flash_attn(q, kv_fp16, kv_quant_data, sm_scale)
+            else: # fp16
+                q_tridao = q.transpose(1, 2).contiguous()
+                k_tridao = kv_fp16.transpose(1, 2).contiguous()
+                v_tridao = kv_fp16.transpose(1, 2).contiguous()
+                # 为反向传播准备好需要清零梯度的张量
+                tensors_to_clear_grad = [q_tridao, k_tridao, v_tridao]
+                fwd_fn = lambda: flash_attn_func(q_tridao, k_tridao, v_tridao, causal=False)
+
+            # --- 前向测试 ---
+            ms_fwd = triton.testing.do_bench(fwd_fn, warmup=50, rep=1000)
+            
+            # --- (前向+反向) 联合测试 ---
+            output_for_grad = fwd_fn()
+            grad_output = torch.randn_like(output_for_grad)
+            
+            # [核心修正] 定义包含前向和反向的函数
+            def fwd_bwd_pass():
+                # 每次都重新执行前向，以创建新的计算图
+                # 注意：q和kv_fp16是在外层定义的，这里会捕获它们
+                output = fwd_fn()
+                # 执行一次反向，不清空计算图
+                output.backward(grad_output)
+
+            # 使用grad_to_none确保每次迭代梯度都被清零
+            tensors_to_clear_grad = [q, kv_fp16] if provider == 'quantized' else [q_tridao, k_tridao, v_tridao]
+            ms_fwd_bwd = triton.testing.do_bench(fwd_bwd_pass, grad_to_none=tensors_to_clear_grad, warmup=50, rep=1000)
+            
+            # --- 计算所有指标 ---
+            ms_bwd = ms_fwd_bwd - ms_fwd
+
+            provider_type = provider
+            io_fwd = calculate_theoretical_io(Z, H, N_CTX_Q, N_CTX_KV, HEAD_DIM, provider_type, 'fwd')
+            io_bwd = calculate_theoretical_io(Z, H, N_CTX_Q, N_CTX_KV, HEAD_DIM, provider_type, 'bwd')
+            
+            tflops_fwd = flops_fwd / (ms_fwd * 1e-3) / 1e12
+            bw_fwd = io_fwd / (ms_fwd * 1e-3) / 1e9
+            
+            tflops_bwd = flops_bwd / (ms_bwd * 1e-3) / 1e12 if ms_bwd > 0.0001 else 0.0
+            bw_bwd = io_bwd / (ms_bwd * 1e-3) / 1e9 if ms_bwd > 0.0001 else 0.0
+
+            results[names[provider]] = {
+                'Time Fwd (ms)': ms_fwd, 'TFLOP/s Fwd': tflops_fwd, 'BW Fwd (GB/s)': bw_fwd,
+                'Time Bwd (ms)': ms_bwd, 'TFLOP/s Bwd': tflops_bwd, 'BW Bwd (GB/s)': bw_bwd,
+            }
+            print(f"   ...测试完成: Fwd {ms_fwd:.4f} ms, Bwd (估算) {ms_bwd:.4f} ms")
+
+        # --- d. 打印总结报告 ---
+        print("\n" + "="*80)
+        print("性能对比总结报告 (Bwd Time = Time(Fwd+Bwd) - Time(Fwd))")
+        print("="*80)
         
-        q = torch.randn((Z, H, N_CTX_Q, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        kv_fp16 = torch.randn((Z, H, N_CTX_KV, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+        df = pd.DataFrame.from_dict(results, orient='index')
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', 120)
         
-        # 定义前向函数
-        if provider == 'quantized':
-            kv_quant_data = asymmetric_quant_per_token(kv_fp16)
-            fwd_fn = lambda: quant_flash_attn(q, kv_fp16, kv_quant_data, sm_scale)
-        else: # fp16
-            q_tridao = q.transpose(1, 2).contiguous()
-            k_tridao = kv_fp16.transpose(1, 2).contiguous()
-            v_tridao = kv_fp16.transpose(1, 2).contiguous()
-            # 为反向传播准备好需要清零梯度的张量
-            tensors_to_clear_grad = [q_tridao, k_tridao, v_tridao]
-            fwd_fn = lambda: flash_attn_func(q_tridao, k_tridao, v_tridao, causal=False)
-
-        # --- 前向测试 ---
-        ms_fwd = triton.testing.do_bench(fwd_fn, warmup=50, rep=1000)
+        for col in df.columns:
+            df[col] = df[col].map('{:.2f}'.format)
+        print(df)
         
-        # --- (前向+反向) 联合测试 ---
-        output_for_grad = fwd_fn()
-        grad_output = torch.randn_like(output_for_grad)
-        
-        # [核心修正] 定义包含前向和反向的函数
-        def fwd_bwd_pass():
-            # 每次都重新执行前向，以创建新的计算图
-            # 注意：q和kv_fp16是在外层定义的，这里会捕获它们
-            output = fwd_fn()
-            # 执行一次反向，不清空计算图
-            output.backward(grad_output)
-
-        # 使用grad_to_none确保每次迭代梯度都被清零
-        tensors_to_clear_grad = [q, kv_fp16] if provider == 'quantized' else [q_tridao, k_tridao, v_tridao]
-        ms_fwd_bwd = triton.testing.do_bench(fwd_bwd_pass, grad_to_none=tensors_to_clear_grad, warmup=50, rep=1000)
-        
-        # --- 计算所有指标 ---
-        ms_bwd = ms_fwd_bwd - ms_fwd
-
-        provider_type = provider
-        io_fwd = calculate_theoretical_io(Z, H, N_CTX_Q, N_CTX_KV, HEAD_DIM, provider_type, 'fwd')
-        io_bwd = calculate_theoretical_io(Z, H, N_CTX_Q, N_CTX_KV, HEAD_DIM, provider_type, 'bwd')
-        
-        tflops_fwd = flops_fwd / (ms_fwd * 1e-3) / 1e12
-        bw_fwd = io_fwd / (ms_fwd * 1e-3) / 1e9
-        
-        tflops_bwd = flops_bwd / (ms_bwd * 1e-3) / 1e12 if ms_bwd > 0.0001 else 0.0
-        bw_bwd = io_bwd / (ms_bwd * 1e-3) / 1e9 if ms_bwd > 0.0001 else 0.0
-
-        results[names[provider]] = {
-            'Time Fwd (ms)': ms_fwd, 'TFLOP/s Fwd': tflops_fwd, 'BW Fwd (GB/s)': bw_fwd,
-            'Time Bwd (ms)': ms_bwd, 'TFLOP/s Bwd': tflops_bwd, 'BW Bwd (GB/s)': bw_bwd,
-        }
-        print(f"   ...测试完成: Fwd {ms_fwd:.4f} ms, Bwd (估算) {ms_bwd:.4f} ms")
-
-    # --- d. 打印总结报告 ---
-    print("\n" + "="*80)
-    print("性能对比总结报告 (Bwd Time = Time(Fwd+Bwd) - Time(Fwd))")
-    print("="*80)
-    
-    df = pd.DataFrame.from_dict(results, orient='index')
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 120)
-    
-    for col in df.columns:
-        df[col] = df[col].map('{:.2f}'.format)
-    print(df)
-    
-    if HAS_FLASH_ATTN:
-        fwd_speedup = results['官方FlashAttention (FP16)']['Time Fwd (ms)'] / results['我的量化版Triton (INT8)']['Time Fwd (ms)']
-        bwd_speedup = results['官方FlashAttention (FP16)']['Time Bwd (ms)'] / results['我的量化版Triton (INT8)']['Time Bwd (ms)']
-        print("\n--- 结论 ---")
-        print(f"前向传播加速比 (INT8 vs FP16): {fwd_speedup:.2f}x")
-        print(f"反向传播加速比 (INT8 vs FP16): {bwd_speedup:.2f}x")
+        if HAS_FLASH_ATTN:
+            fwd_speedup = results['官方FlashAttention (FP16)']['Time Fwd (ms)'] / results['我的量化版Triton (INT8)']['Time Fwd (ms)']
+            bwd_speedup = results['官方FlashAttention (FP16)']['Time Bwd (ms)'] / results['我的量化版Triton (INT8)']['Time Bwd (ms)']
+            print("\n--- 结论 ---")
+            print(f"前向传播加速比 (INT8 vs FP16): {fwd_speedup:.2f}x")
+            print(f"反向传播加速比 (INT8 vs FP16): {bwd_speedup:.2f}x")
 
 # ------------------------------------------------------------------
 # 4. 主程序入口
