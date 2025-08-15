@@ -179,7 +179,7 @@ class QuantFlashAttention(torch.autograd.Function):
     def forward(ctx, q, kv_fp16, kv_quant, sm_scale):
         Z, H, N_CTX_Q, HEAD_DIM = q.shape
         _, _, N_CTX_KV, _ = kv_fp16.shape
-        PADDED_N_CTX_Q = max(triton.next_power_of_2(N_CTX_Q), 16)
+        PADDED_N_CTX_Q = N_CTX_Q
         kv_quant, kv_scale, kv_zero_point = kv_quant
         o = torch.empty_like(q)
         lse = torch.empty((Z, H, PADDED_N_CTX_Q), device=q.device, dtype=torch.float32)
