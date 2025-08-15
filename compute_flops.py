@@ -91,9 +91,9 @@ def run_benchmark():
     print("开始性能对比测试 (使用差值法测量反向传播，避免OOM)")
     print("="*80)
 
-    for HEAD_DIM in [64, 128, 256, 512]:
+    for HEAD_DIM in [64, 128, 256]:
         # --- a. 定义测试参数 ---
-        Z, H, N_CTX_Q, N_CTX_KV = 128, 16, 3, 3000
+        Z, H, N_CTX_Q, N_CTX_KV = 128, 16, 32, 3000
         dtype = torch.float16
         device = "cuda"
 
