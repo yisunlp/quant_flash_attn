@@ -93,7 +93,7 @@ def run_benchmark():
 
     for HEAD_DIM in [64, 128, 256, 512]:
         # --- a. 定义测试参数 ---
-        Z, H, N_CTX_Q, N_CTX_KV = 512, 16, 16, 3000
+        Z, H, N_CTX_Q, N_CTX_KV = 128, 16, 3, 3000
         dtype = torch.float16
         device = "cuda"
 
