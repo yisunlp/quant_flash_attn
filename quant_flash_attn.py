@@ -35,8 +35,8 @@ def _attn_fwd_kernel_quantized(
     HEAD_DIM: tl.constexpr, PADDED_N_CTX_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     program_id = tl.program_id(0)
-    off_z = program_id // H
-    off_h = program_id % H
+    off_z = (program_id // H).to(tl.int64)
+    off_h = (program_id % H).to(tl.int64)
     q_base_ptr = Q + off_z * stride_qz + off_h * stride_qh
     kv_quant_base_ptr = KV_quant + off_z * stride_kvq_z + off_h * stride_kvq_h
     kv_scale_base_ptr = KV_scale + off_z * stride_kvs_z + off_h * stride_kvs_h
@@ -118,8 +118,8 @@ def _bwd_kernel_quantized(
     HEAD_DIM: tl.constexpr, PADDED_N_CTX_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     program_id = tl.program_id(0)
-    off_z = program_id // H
-    off_h = program_id % H
+    off_z = (program_id // H).to(tl.int64)
+    off_h = (program_id % H).to(tl.int64)
     q_base_ptr = Q + off_z * stride_qz + off_h * stride_qh
     kv_quant_base_ptr = KV_quant + off_z * stride_kvq_z + off_h * stride_kvq_h
     kv_scale_base_ptr = KV_scale + off_z * stride_kvs_z + off_h * stride_kvs_h
