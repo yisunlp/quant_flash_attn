@@ -90,11 +90,8 @@ def run_benchmark():
     print("\n" + "="*80)
     print("开始性能对比测试 (使用差值法测量反向传播，避免OOM)")
     print("="*80)
-    
-    # [核心修正] 将结果收集移到循环外部，以便所有HEAD_DIM的结果都在一张表里
-    all_results = {}
 
-    for HEAD_DIM in [64, 128, 256]:
+    for HEAD_DIM in [64, 128, 256, 512]:
         # --- a. 定义测试参数 ---
         Z, H, N_CTX_Q, N_CTX_KV = 512, 16, 16, 3000
         dtype = torch.float16
@@ -111,8 +108,6 @@ def run_benchmark():
         names = {'quantized': '我的量化版Triton (INT8)', 'fp16': '官方FlashAttention (FP16)'}
 
         for provider in providers:
-            # print(f"  -> 正在测试 {names[provider]}...")
-            
             q = torch.randn((Z, H, N_CTX_Q, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
             kv_fp16 = torch.randn((Z, H, N_CTX_KV, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
             sm_scale = 1.0 / (HEAD_DIM ** 0.5)
@@ -155,33 +150,32 @@ def run_benchmark():
                 'Time Bwd (ms)': ms_bwd, 'TFLOP/s Bwd': tflops_bwd, 'BW Bwd (GB/s)': bw_bwd,
             }
         
-        all_results[HEAD_DIM] = results_per_dim
+        # --- [核心修正] 在每个HEAD_DIM循环后立即打印对齐的表格 ---
+        print("\n" + "-"*80)
+        print(f"性能对比总结报告 (HEAD_DIM = {HEAD_DIM})")
+        print("-" * 80)
+        
+        # 定义表头和列宽
+        header = f"{'实现版本':<30} | {'Time Fwd(ms)':>15} | {'TFLOP/s Fwd':>15} | {'BW Fwd(GB/s)':>15} | {'Time Bwd(ms)':>15} | {'TFLOP/s Bwd':>15} | {'BW Bwd(GB/s)':>15}"
+        print(header)
+        print("-" * len(header))
 
-    # --- d. 打印所有总结报告 ---
-    for head_dim, results in all_results.items():
-        print("\n" + "="*80)
-        print(f"性能对比总结报告 (HEAD_DIM = {head_dim})")
-        print("="*80)
-        
-        df = pd.DataFrame.from_dict(results, orient='index')
-        
-        # [核心修正] 调整列名以减少宽度，并设置pandas以获得更好的排版
-        df.columns = ['Time Fwd(ms)', 'TFLOP/s Fwd', 'BW Fwd(GB/s)', 
-                      'Time Bwd(ms)', 'TFLOP/s Bwd', 'BW Bwd(GB/s)']
-        
-        # 格式化输出
-        for col in df.columns:
-            df[col] = df[col].map('{:.2f}'.format)
-        
-        # 设置pandas显示选项以防止换行
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', 200) # 设置一个足够宽的宽度
-        
-        print(df)
+        # 打印每一行数据
+        for name, metrics in results_per_dim.items():
+            row = (
+                f"{name:<30} | "
+                f"{metrics['Time Fwd (ms)']:>15.4f} | "
+                f"{metrics['TFLOP/s Fwd']:>15.2f} | "
+                f"{metrics['BW Fwd (GB/s)']:>15.2f} | "
+                f"{metrics['Time Bwd (ms)']:>15.4f} | "
+                f"{metrics['TFLOP/s Bwd']:>15.2f} | "
+                f"{metrics['BW Bwd (GB/s)']:>15.2f}"
+            )
+            print(row)
         
         if HAS_FLASH_ATTN:
-            fwd_speedup = results['官方FlashAttention (FP16)']['Time Fwd (ms)'] / results['我的量化版Triton (INT8)']['Time Fwd (ms)']
-            bwd_speedup = results['官方FlashAttention (FP16)']['Time Bwd (ms)'] / results['我的量化版Triton (INT8)']['Time Bwd (ms)']
+            fwd_speedup = results_per_dim['官方FlashAttention (FP16)']['Time Fwd (ms)'] / results_per_dim['我的量化版Triton (INT8)']['Time Fwd (ms)']
+            bwd_speedup = results_per_dim['官方FlashAttention (FP16)']['Time Bwd (ms)'] / results_per_dim['我的量化版Triton (INT8)']['Time Bwd (ms)']
             print("\n--- 结论 ---")
             print(f"前向传播加速比 (INT8 vs FP16): {fwd_speedup:.2f}x")
             print(f"反向传播加速比 (INT8 vs FP16): {bwd_speedup:.2f}x")
