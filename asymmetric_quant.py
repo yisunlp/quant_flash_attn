@@ -36,7 +36,9 @@ def _asymmetric_quant_kernel(
     scale_ptr,
     zero_point_ptr,
     # --- Stride Info ---
-    stride_z, stride_h, stride_m, stride_k,
+    # [修正] 为输入和输出分别提供stride
+    stride_in_z, stride_in_h, stride_in_m, stride_in_k,
+    stride_out_z, stride_out_h, stride_out_m, stride_out_k,
     # --- Dimensions ---
     Z, H, M, HEAD_DIM: tl.constexpr,
     # --- Block Size for Tiling within a token vector ---
@@ -47,33 +49,27 @@ def _asymmetric_quant_kernel(
     Each program in the grid processes one token vector of size HEAD_DIM.
     """
     # --- 1. Initialization ---
-    # The grid is 1D, with a total of Z * H * M programs.
-    # Each program computes quantization for a single token.
     pid = tl.program_id(0)
-
-    # [核心改动] 将一维的pid映射回三维的(z, h, m)索引
     m_idx = pid % M
     h_idx = (pid // M) % H
     z_idx = pid // (M * H)
 
-    # 定位到当前token的起始地址
-    token_input_ptr = input_ptr + z_idx * stride_z + h_idx * stride_h + m_idx * stride_m
-    token_quantized_output_ptr = quantized_output_ptr + z_idx * stride_z + h_idx * stride_h + m_idx * stride_m
+    # 定位到当前token的起始地址 (使用各自的stride)
+    token_input_ptr = input_ptr + z_idx * stride_in_z + h_idx * stride_in_h + m_idx * stride_in_m
+    # [修正] 使用输出张量自己的stride来计算输出指针
+    token_quantized_output_ptr = quantized_output_ptr + z_idx * stride_out_z + h_idx * stride_out_h + m_idx * stride_out_m
     
     # --- 2. Find Min/Max of the Token Vector ---
     min_val = float('inf')
     max_val = float('-inf')
     col_offsets = tl.arange(0, BLOCK_SIZE_K)
     
-    # 循环遍历整个token向量 (长度为HEAD_DIM)
     for block_start in range(0, HEAD_DIM, BLOCK_SIZE_K):
         current_offsets = block_start + col_offsets
         mask = current_offsets < HEAD_DIM
         
-        # 加载token向量的一个分块
-        values = tl.load(token_input_ptr + current_offsets * stride_k, mask=mask, other=0.0)
+        values = tl.load(token_input_ptr + current_offsets * stride_in_k, mask=mask, other=0.0)
         
-        # 更新min/max
         min_val = tl.minimum(min_val, tl.min(tl.where(mask, values, float('inf'))))
         max_val = tl.maximum(max_val, tl.max(tl.where(mask, values, float('-inf'))))
 
@@ -95,12 +91,13 @@ def _asymmetric_quant_kernel(
         current_offsets = block_start + col_offsets
         mask = current_offsets < HEAD_DIM
         
-        values = tl.load(token_input_ptr + current_offsets * stride_k, mask=mask, other=0.0)
+        values = tl.load(token_input_ptr + current_offsets * stride_in_k, mask=mask, other=0.0)
         
         quantized_values_float = tl.extra.cuda.libdevice.round(values / scale + zero_point)
         quantized_values = tl.maximum(q_min, tl.minimum(q_max, quantized_values_float))
         
-        tl.store(token_quantized_output_ptr + current_offsets * stride_k, quantized_values.to(tl.int8), mask=mask)
+        # [修正] 使用输出张量自己的stride来存储
+        tl.store(token_quantized_output_ptr + current_offsets * stride_out_k, quantized_values.to(tl.int8), mask=mask)
 
 
 def asymmetric_quant_per_token(input_tensor: torch.Tensor):
@@ -120,25 +117,25 @@ def asymmetric_quant_per_token(input_tensor: torch.Tensor):
     Z, H, M, K = input_tensor.shape
     device = input_tensor.device
 
-    # Create output tensors with the correct per-token shape.
     quantized_output = torch.empty_like(input_tensor, dtype=torch.int8)
     scale = torch.empty(Z, H, M, 1, dtype=torch.float16, device=device)
     zero_point = torch.empty(Z, H, M, 1, dtype=torch.int8, device=device)
 
-    # [核心改动] Grid size is now the total number of tokens.
     grid = (Z * H * M,)
     
-    # Kernel expects 1D views of scale and zp for simple indexing with pid.
     scale_1d = scale.view(-1)
     zero_point_1d = zero_point.view(-1)
 
+    # [修正] 将输入和输出的stride都传入核函数
     _asymmetric_quant_kernel[grid](
         input_tensor,
         quantized_output,
         scale_1d,
         zero_point_1d,
-        # Strides are for the original 4D tensor.
+        # Strides for input_tensor
         input_tensor.stride(0), input_tensor.stride(1), input_tensor.stride(2), input_tensor.stride(3),
+        # Strides for quantized_output
+        quantized_output.stride(0), quantized_output.stride(1), quantized_output.stride(2), quantized_output.stride(3),
         # Dimensions
         Z, H, M, HEAD_DIM=K,
     )
@@ -174,12 +171,9 @@ if __name__ == "__main__":
             
             input_fp16 = torch.randn((Z, H, M, K), dtype=torch.float16, device="cuda")
             
-            # Run Triton per-token quantization.
             quant_triton, scale_triton, zp_triton = asymmetric_quant_per_token(input_fp16)
             
-            # Dequantize the result back to float.
             dequantized_triton = dequantize_per_token_torch(quant_triton, scale_triton, zp_triton)
-            # Calculate the Mean Absolute Error (MAE).
             mae = torch.mean(torch.abs(input_fp16.float() - dequantized_triton.float())).item()
             print(f"✅ Quantization Precision Loss (MAE): {mae:.6f}")
     
