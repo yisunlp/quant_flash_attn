@@ -52,10 +52,13 @@ def _asymmetric_quant_kernel(
     pid = tl.program_id(0)
 
     # [核心改动] 将一维的pid映射回三维的(z, h, m)索引
-    m_idx = pid % M
-    h_idx = (pid // M) % H
-    z_idx = pid // (M * H)
+    pid_64 = pid.to(tl.int64)
+    M_64 = M.to(tl.int64)
+    H_64 = H.to(tl.int64)
 
+    m_idx = pid_64 % M_64
+    h_idx = (pid_64 // M_64) % H_64
+    z_idx = pid_64 // (M_64 * H_64)
     # 定位到当前token的起始地址
     token_input_ptr = input_ptr + z_idx * stride_z + h_idx * stride_h + m_idx * stride_m
     token_quantized_output_ptr = quantized_output_ptr + z_idx * stride_z + h_idx * stride_h + m_idx * stride_m
